@@ -11,10 +11,13 @@ strategy:
   matrix:
     linux:
       imageName: "ubuntu-latest"
+      testRunTitle: "Linux"
     mac:
       imageName: "macOS-latest"
+      testRunTitle: "MacOS"
     windows:
       imageName: "windows-latest"
+      testRunTitle: "Windows"
   maxParallel: 3
 
 pool:
@@ -30,4 +33,5 @@ steps:
     jdkArchitectureOption: 'x64'
     publishJUnitResults: true
     testResultsFiles: '**/surefire-reports/TEST-*.xml'
+    testRunTitle: $(testRunTitle)
     goals: 'package'
