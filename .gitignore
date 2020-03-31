@@ -6,6 +6,8 @@
 # Java
 *.iml
 target/
+.metals/
+.settings/
 # Compiled class file
 *.class
 
