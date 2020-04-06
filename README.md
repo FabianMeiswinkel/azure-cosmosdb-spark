@@ -1,9 +1,5 @@
+# azure-cosmosdb-spark
 <img src="https://raw.githubusercontent.com/dennyglee/azure-cosmosdb-spark/master/docs/images/azure-cosmos-db-icon.png" width="75">  &nbsp; Azure Cosmos DB Connector for Apache Spark
-==========================================
-
-[![Build Status](https://travis-ci.org/Azure/azure-cosmosdb-spark.svg?branch=master)](https://travis-ci.org/Azure/azure-cosmosdb-spark)
-
-
 `azure-cosmosdb-spark` is the official connector for [Azure CosmosDB](http://cosmosdb.com) and [Apache Spark](http://spark.apache.org). The connector allows you to easily read to and write from Azure Cosmos DB via Apache Spark DataFrames in `python` and `scala`.  It also allows you to easily create a lambda architecture for batch-processing, stream-processing, and a serving layer while being globally replicated and minimizing the latency involved in working with big data.
 
 
@@ -127,9 +123,9 @@ flights.write.mode(SaveMode.Overwrite).cosmosDB(writeConfig)
 
 | Component | Versions Supported |
 | --------- | ------------------ |
-| Apache Spark | 2.2.1, 2.3.X, 2.4.X |
+| Apache Spark | 2.4.X |
 | Scala | 2.11 |
-| Python | 2.7, 3.6 |
+| Python | 3.7.3 |
 
 &nbsp;
 
@@ -138,12 +134,8 @@ You can build and/or use the maven coordinates to work with `azure-cosmosdb-spar
 
 <em>Review the connector's <strong>maven versions</strong></em>
 
-| Spark | Scala | Latest version |
-|---|---|---|
-| 2.4.0 | 2.11 | [azure-cosmosdb-spark_2.4.0_2.11_1.4.0](https://repo1.maven.org/maven2/com/microsoft/azure/azure-cosmosdb-spark_2.4.0_2.11/1.4.0/azure-cosmosdb-spark_2.4.0_2.11-1.4.0-uber.jar)
-| 2.3.0 | 2.11 | [azure-cosmosdb-spark_2.3.0_2.11_1.3.3](https://search.maven.org/artifact/com.microsoft.azure/azure-cosmosdb-spark_2.3.0_2.11/1.3.3/jar)
-| 2.2.0 | 2.11 | [azure-cosmosdb-spark_2.2.0_2.11_1.1.1](https://search.maven.org/#artifactdetails%7Ccom.microsoft.azure%7Cazure-cosmosdb-spark_2.2.0_2.11%7C1.1.1%7Cjar)
-| 2.1.0 | 2.11 | [azure-cosmosdb-spark_2.1.0_2.11_1.2.2](https://search.maven.org/artifact/com.microsoft.azure/azure-cosmosdb-spark_2.1.0_2.11/1.2.2)
+| Spark | Scala | Latest version                                                        |
+| 2.4.0  | 2.11   | [azure-cosmosdb-spark_2.4.0_2.11_1.4.0](https://repo1.maven.org/maven2/com/microsoft/azure/azure-cosmosdb-spark_2.4.0_2.11/1.4.0/azure-cosmosdb-spark_2.4.0_2.11-1.4.0-uber.jar)          |
 
 ### Using Databricks notebooks
 Please create a library using within your Databricks workspace by following the guidance within the Azure Databricks Guide > [Use the Azure Cosmos DB Spark connector](https://docs.azuredatabricks.net/spark/latest/data-sources/azure/cosmosdb-connector.html)
