@@ -121,6 +121,18 @@ limitations under the License.
 					<artifactId>maven-compiler-plugin</artifactId>
 					<version>3.8.1</version>
 				</plugin>
+                <plugin>
+					<groupId>org.apache.maven.plugins</groupId>
+					<artifactId>maven-checkstyle-plugin</artifactId>
+					<version>3.1.1</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>com.puppycrawl.tools</groupId>
+                            <artifactId>checkstyle</artifactId>
+                            <version>8.31</version>
+                        </dependency>
+                    </dependencies>
+				</plugin>
 			</plugins>
 		</pluginManagement>
         <plugins>
@@ -592,6 +604,68 @@ limitations under the License.
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+                <version>3.1.1</version>
+                <configuration>
+                    <includeTestSourceDirectory>true</includeTestSourceDirectory>
+                    <configLocation>checkstyle.xml</configLocation>
+                    <logViolationsToConsole>true</logViolationsToConsole>
+                    <encoding>UTF-8</encoding>
+                    <consoleOutput>true</consoleOutput>
+                    <failsOnError>true</failsOnError>
+                    <linkXRef>false</linkXRef>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>validate-style</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>verify-style</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+            <groupId>org.scalastyle</groupId>
+            <artifactId>scalastyle-maven-plugin</artifactId>
+            <version>1.0.0</version>
+            <configuration>
+              <verbose>false</verbose>
+              <failOnViolation>true</failOnViolation>
+              <includeTestSourceDirectory>true</includeTestSourceDirectory>
+              <failOnWarning>true</failOnWarning>
+              <sourceDirectory>${project.basedir}/src/main/scala</sourceDirectory>
+              <testSourceDirectory>${project.basedir}/src/test/scala</testSourceDirectory>
+              <configLocation>${project.basedir}/scalastyle_config.xml</configLocation>
+              <outputFile>${project.basedir}/scalastyle-output.xml</outputFile>
+              <outputEncoding>UTF-8</outputEncoding>
+            </configuration>
+            <executions>
+                <execution>
+                    <id>validate-style</id>
+                    <phase>validate</phase>
+                    <goals>
+                        <goal>check</goal>
+                    </goals>
+                </execution>
+                <execution>
+                    <id>verify-style</id>
+                    <phase>verify</phase>
+                    <goals>
+                        <goal>check</goal>
+                    </goals>
+                </execution>
+            </executions>
+          </plugin>
         </plugins>
     </build>
     <developers>
