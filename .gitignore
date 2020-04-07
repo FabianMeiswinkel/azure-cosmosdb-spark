@@ -384,3 +384,6 @@ MigrationBackup/
 .settings/org.eclipse.m2e.core.prefs
 .classpath
 .vscode/settings.json
+
+# ScalaStyle output file
+scalastyle-output.xml
