@@ -20,9 +20,24 @@
   SOFTWARE.
  */
 
-package com.microsoft.azure.cosmos.spark;
+package com.microsoft.azure.cosmos.spark.oltp
 
-import org.apache.spark.sql.sources.v2.DataSourceV2;
+import org.apache.spark.sql.sources.DataSourceRegister
+import org.apache.spark.sql.sources.v2.DataSourceOptions
+import org.apache.spark.sql.sources.v2.DataSourceV2
+import org.apache.spark.sql.sources.v2.ReadSupport
+import org.apache.spark.sql.sources.v2.reader.DataSourceReader
+import org.apache.spark.sql.types.StructType
 
-public final class CosmosOnlineTransactionProcessingDataSource implements DataSourceV2 {
+
+final class ChangeFeedDataSource extends DataSourceRegister with DataSourceV2 with ReadSupport {
+  override def createReader(schema: StructType, options: DataSourceOptions): DataSourceReader = {
+    throw new NotImplementedError()
+  }
+
+  override def createReader(options: DataSourceOptions): DataSourceReader = {
+    throw new NotImplementedError()
+  }
+
+  override def shortName : String = "cosmos.oltp.changefeed"
 }

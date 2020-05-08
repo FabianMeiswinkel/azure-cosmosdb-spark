@@ -469,7 +469,8 @@ fabric.properties
 .idea/**/markdown-navigator/
 
 # bloop
-.bloop/**
+.bloop/
+.idea/
 
 # ScalaStyle output file
 scalastyle-output.xml
