@@ -95,7 +95,7 @@ limitations under the License.
         <dependency>
             <groupId>com.azure</groupId>
             <artifactId>azure-cosmos</artifactId>
-            <version>4.0.1-beta.2</version>
+            <version>4.0.1</version>
         </dependency>
     </dependencies>
     <build>

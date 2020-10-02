@@ -20,24 +20,26 @@
   SOFTWARE.
  */
 
-package com.microsoft.azure.cosmos.spark.oltp
+package com.microsoft.azure.cosmos.spark.oltp.items
 
+import org.apache.spark.sql.connector.catalog.{Table, TableProvider}
+import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.sources.DataSourceRegister
-import org.apache.spark.sql.sources.v2.DataSourceOptions
-import org.apache.spark.sql.sources.v2.DataSourceV2
-import org.apache.spark.sql.sources.v2.ReadSupport
-import org.apache.spark.sql.sources.v2.reader.DataSourceReader
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-
-final class ChangeFeedDataSource extends DataSourceRegister with DataSourceV2 with ReadSupport {
-  override def createReader(schema: StructType, options: DataSourceOptions): DataSourceReader = {
+final class ItemsDataSource extends TableProvider with DataSourceRegister {
+  def inferSchema(options: CaseInsensitiveStringMap): StructType = {
     throw new NotImplementedError()
   }
 
-  override def createReader(options: DataSourceOptions): DataSourceReader = {
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    this.getTable(options, this.inferSchema(options))
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap, schema: StructType): Table = {
     throw new NotImplementedError()
   }
 
-  override def shortName : String = "cosmos.oltp.changefeed"
+  override def shortName: String = "cosmos.oltp.items"
 }
