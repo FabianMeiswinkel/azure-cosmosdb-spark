@@ -21,6 +21,7 @@
   * SOFTWARE.
   */
 package com.microsoft.azure.cosmosdb.spark.config
+import com.microsoft.azure.cosmosdb.spark.config
 
 /**
  * Values and Functions for access and parse the configuration parameters
@@ -29,11 +30,16 @@ object CosmosDBConfig {
 
   //  Parameter names
 
+  // Environment variable name
+  val EndpointEnvVarName = "COSMOS_ENDPOINT"
+  val KeyEnvVarname = "COSMOS_KEY"
+
   // Cosmos DB account related config
   val Endpoint = "endpoint"
   val Database = "database"
   val Collection = "collection"
   val Masterkey = "masterkey"
+  val ResourceToken = "resourcetoken"
 
   val PreferredRegionsList = "preferredregions"
   val ConsistencyLevel = "consistencylevel"
@@ -59,28 +65,44 @@ object CosmosDBConfig {
   val QueryDisableRUPerMinuteUsage = "query_disableruperminuteusage"
   val QueryEmitVerboseTraces = "query_emitverbosetraces"
   val ResponseContinuationTokenLimitInKb = "response_continuationtoken_limit_kb"
+  val ConvertNestedDocsToNativeJsonFormat = "convertnesteddocstonativejsonformat"
 
   // Change feed streaming related
   val ReadChangeFeed = "readchangefeed"
   val RollingChangeFeed = "rollingchangefeed"
   val ChangeFeedStartFromTheBeginning = "changefeedstartfromthebeginning"
+  val ChangeFeedStartFromDateTime = "changefeedstartfromdatetime"
   val ChangeFeedUseNextToken = "changefeedusenexttoken"
   val ChangeFeedContinuationToken = "changefeedcontinuationtoken"
+  val ChangeFeedMaxPagesPerBatch = "changefeedmaxpagesperbatch"
   val IncrementalView = "incrementalview"
   val StructuredStreaming = "structuredstreaming"
   val CachingModeParam = "cachingmode"
   val ChangeFeedQueryName = "changefeedqueryname"
-  val ChangeFeedNewQuery = "changefeednewquery"
-  val ChangeFeedCheckpointLocation = "changefeedcheckpointlocation"
+    val ChangeFeedCheckpointLocation = "changefeedcheckpointlocation"
   val InferStreamSchema = "inferstreamschema"
 
+  // Structured Streaming WriteStream retry policy related
+  val WriteStreamRetryPolicyKind = "writestreamretrypolicy.kind"
+  val MaxTransientRetryCount = "writestreamretrypolicy.maxtransientretrycount"
+  val MaxTransientRetryDurationInMs = "writestreamretrypolicy.maxtransientretrydurationinms"
+  val MaxTransientRetryDelayInMs = "writestreamretrypolicy.maxtransientretrydelayinms"
+  val PoisonMessageLocation = "writestreamretrypolicy.poisonmessagelocation"
+  val TreatUnknownExceptionsAsTransient = "writestreamretrypolicy.treatunknownexceptionsastransient"
+  val DefaultWriteStreamRetryPolicyKind = "NoRetries"
+  val DefaultMaxTransientRetryCount: Int = Int.MaxValue
+  val DefaultMaxTransientRetryDurationInMs: Int = 1000 * 60 * 60 // 1 hour
+  val DefaultMaxTransientRetryDelayInMs = 100 // 0.1 second
+  val DefaultPoisonMessageLocation = ""
+  val DefaultTreatUnknownExceptionsAsTransient = true
+  
   // Not a config, constant
   val StreamingTimestampToken = "tsToken"
 
   // Write path related config
   val Upsert = "upsert"
-  val ClientInitDelay = "clientinitdelay"
   val RootPropertyToSave = "rootpropertytosave"
+  val PreserveNullInWrite = "preservenullinwrite"
 
   // Bulk executor library related
   val BulkImport = "bulkimport"
@@ -90,27 +112,12 @@ object CosmosDBConfig {
   val PartitionKeyDefinition = "partitionkeydefinition"
   val WriteThroughputBudget = "writethroughputbudget"
   val BulkImportMaxConcurrencyPerPartitionRange = "bulkimport_maxconcurrencyperpartitionrange"
+  val MaxMiniBatchImportSizeKB = "maxminibatchimportsizekb"
+  val BaseMiniBatchRUConsumption = "baseminibatchruconsumption"
+  val MaxIngestionTaskParallelism = "maxingestiontaskparallelism"
 
   // Rx Java related write config
   val WritingBatchDelayMs = "writingbatchdelayms"
-
-  // Writing progress tracking
-  val WritingBatchId = "writingbatchid"
-  val CosmosDBFileStoreCollection = "cosmosdbfilestorecollection"
-
-  // ADL import
-  val adlAccountFqdn = "adlaccountfqdn"
-  val adlClientId = "adlclientid"
-  val adlAuthTokenEndpoint = "adlauthtokenendpoint"
-  val adlClientKey = "adlclientkey"
-  val adlDataFolder = "adldatafolder"
-  val adlIdField = "adlidfield"
-  val adlPkField = "adlpkfield"
-  val adlUseGuidForId = "adluseguidforid"
-  val adlUseGuidForPk = "adluseguidforpk"
-  val adlFileCheckpointPath = "adlfilecheckpointpath"
-  val adlCosmosDbDataCollectionPkValue = "adlcosmosdbdatacolletionpkvalue"
-  val adlMaxFileCount = "adlmaxfilecount"
 
   val ApplicationName = "application_name"
 
@@ -122,7 +129,6 @@ object CosmosDBConfig {
   // Mandatory
   val required = List(
     Endpoint,
-    Masterkey,
     Database,
     Collection
   )
@@ -133,18 +139,19 @@ object CosmosDBConfig {
   val DefaultQueryMaxRetryWaitTimeSecs = 1000
   val DefaultSamplingRatio = 1.0
   val DefaultPageSize = 1000
-  val DefaultSampleSize = DefaultPageSize
+  val DefaultSampleSize: Int = DefaultPageSize
   val DefaultUpsert = false
+  val DefaultPreserveNullInWrite = false
   val DefaultReadChangeFeed = false
   val DefaultStructuredStreaming = false
   val DefaultRollingChangeFeed = false
   val DefaultChangeFeedStartFromTheBeginning = false
   val DefaultChangeFeedUseNextToken = false
+  val DefaultChangeFeedMaxPagesPerBatch: Int = Integer.MAX_VALUE
   val DefaultIncrementalView = false
-  val DefaultCacheMode = CachingMode.NONE
-  val DefaultChangeFeedNewQuery = false
-  val DefaultQueryMaxDegreeOfParallelism = Integer.MAX_VALUE
-  val DefaultQueryMaxBufferedItemCount = Integer.MAX_VALUE
+  val DefaultCacheMode: CachingMode.Value = CachingMode.NONE
+  val DefaultQueryMaxDegreeOfParallelism: Int = Integer.MAX_VALUE
+  val DefaultQueryMaxBufferedItemCount: Int = Integer.MAX_VALUE
   val DefaultResponseContinuationTokenLimitInKb = 10
   val DefaultWritingBatchSize_BulkInsert = 100000
   val DefaultWritingBatchSize_PointInsert = 500
@@ -153,8 +160,6 @@ object CosmosDBConfig {
   val DefaultBulkImport = true
   val DefaultBulkUpdate = false
   val DefaultMaxMiniBatchUpdateCount = 500
-  val DefaultClientInitDelay = 10
-
   val DefaultAdlUseGuidForId = true
   val DefaultAdlUseGuidForPk = true
   val DefaultAdlMaxFileCount: Int = Int.MaxValue
@@ -165,8 +170,16 @@ object CosmosDBConfig {
 
   val DefaultMaxConnectionPoolSize = 500
 
+  val DefaultMaxMiniBatchImportSizeKB = 100
+
+  val DefaultBulkImportMaxConcurrencyPerPartitionRange = 1
+
+  val DefaultBaseMiniBatchRUConsumption = 2000
+
+  val  DefaultConvertNestedDocsToNativeJsonFormat = false
+
   def parseParameters(parameters: Map[String, String]): Map[String, Any] = {
-    return parameters.map { case (x, v) => x -> v }
+    parameters.map { case (x, v) => x -> v }
   }
 }
 
@@ -179,7 +192,7 @@ object CosmosDBConfig {
   */
 object CachingMode extends Enumeration {
   type CachingMode = Value
-  val NONE = Value("None")
-  val CACHE = Value("Cache")
-  val REFRESH_CACHE = Value("RefreshCache")
+  val NONE: config.CachingMode.Value = Value("None")
+  val CACHE: config.CachingMode.Value = Value("Cache")
+  val REFRESH_CACHE: config.CachingMode.Value = Value("RefreshCache")
 }

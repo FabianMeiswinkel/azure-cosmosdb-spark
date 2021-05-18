@@ -22,19 +22,21 @@
   */
 package com.microsoft.azure.cosmosdb.spark.streaming
 
-import com.microsoft.azure.cosmosdb.spark.LoggingTrait
+import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
 import com.microsoft.azure.cosmosdb.spark.config.{Config, CosmosDBConfig}
 import com.microsoft.azure.cosmosdb.spark.rdd.CosmosDBRDDIterator
 import com.microsoft.azure.cosmosdb.spark.schema._
 import com.microsoft.azure.cosmosdb.spark.util.HdfsUtils
 import org.apache.commons.lang3.StringUtils
+import org.apache.spark.sql.cosmosdb.util.StreamingUtils
 import org.apache.spark.sql.execution.streaming.{Offset, Source}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, SQLContext}
 
 private[spark] class CosmosDBSource(sqlContext: SQLContext,
-                                    configMap: Map[String, String])
-  extends Source with LoggingTrait {
+                                    configMap: Map[String, String],
+                                    customSchema: Option[StructType])
+  extends Source with CosmosDBLoggingTrait {
 
   val streamConfigMap: Map[String, String] = configMap.
     -(CosmosDBConfig.ReadChangeFeed).
@@ -61,13 +63,14 @@ private[spark] class CosmosDBSource(sqlContext: SQLContext,
     }
 
     if (currentSchema == null) {
+      val changeFeedCheckpointLocation: String = streamConfigMap
+        .getOrElse(CosmosDBConfig.ChangeFeedCheckpointLocation, StringUtils.EMPTY)
       CosmosDBRDDIterator.initializeHdfsUtils(HdfsUtils.getConfigurationMap(
-        sqlContext.sparkSession.sparkContext.hadoopConfiguration).toMap)
+        sqlContext.sparkSession.sparkContext.hadoopConfiguration).toMap, changeFeedCheckpointLocation)
 
       // Delete current tokens and next tokens checkpoint directories to ensure change feed starts from beginning if set
-      if (streamConfigMap.getOrElse(CosmosDBConfig.ChangeFeedStartFromTheBeginning, String.valueOf(false)).toBoolean) {
-        val changeFeedCheckpointLocation: String = streamConfigMap
-          .getOrElse(CosmosDBConfig.ChangeFeedCheckpointLocation, StringUtils.EMPTY)
+      if (streamConfigMap.getOrElse(CosmosDBConfig.ChangeFeedStartFromTheBeginning, String.valueOf(false)).toBoolean ||
+         StringUtils.isNotBlank(streamConfigMap.getOrElse(CosmosDBConfig.ChangeFeedStartFromDateTime, ""))) {
         val queryName = Config(streamConfigMap)
           .get[String](CosmosDBConfig.ChangeFeedQueryName).get
         val currentTokensCheckpointPath = changeFeedCheckpointLocation + "/" + HdfsUtils.filterFilename(queryName)
@@ -85,6 +88,7 @@ private[spark] class CosmosDBSource(sqlContext: SQLContext,
       val helperDfConfig: Map[String, String] = streamConfigMap
         .-(CosmosDBConfig.ChangeFeedStartFromTheBeginning)
         .+((CosmosDBConfig.ChangeFeedStartFromTheBeginning, String.valueOf(false)))
+        .-(CosmosDBConfig.ChangeFeedStartFromDateTime)
         .-(CosmosDBConfig.ReadChangeFeed).
         +((CosmosDBConfig.ReadChangeFeed, String.valueOf(false)))
         .-(CosmosDBConfig.QueryCustom).
@@ -93,7 +97,7 @@ private[spark] class CosmosDBSource(sqlContext: SQLContext,
         getOrElse(CosmosDBConfig.InferStreamSchema, CosmosDBConfig.DefaultInferStreamSchema.toString).
         toBoolean
 
-      if (shouldInferSchema) {
+      if (shouldInferSchema && customSchema.isEmpty) {
         // Dummy batch read query to sample schema
         val df = sqlContext.read.cosmosDB(Config(helperDfConfig))
         val tokens = CosmosDBRDDIterator.getCollectionTokens(Config(configMap))
@@ -105,15 +109,15 @@ private[spark] class CosmosDBSource(sqlContext: SQLContext,
 
         currentSchema = df.schema
       } else {
-        currentSchema = cosmosDbStreamSchema
+        currentSchema = customSchema.getOrElse(cosmosDbStreamSchema)
       }
     }
     currentSchema
   }
 
   override def getOffset: Option[Offset] = {
-    var nextTokens = CosmosDBRDDIterator.getCollectionTokens(Config(streamConfigMap))
-    var offset = CosmosDBOffset(nextTokens)
+    val nextTokens = CosmosDBRDDIterator.getCollectionTokens(Config(streamConfigMap))
+    val offset = CosmosDBOffset(nextTokens)
     logDebug(s"getOffset: $offset")
     Some(offset)
   }
@@ -137,15 +141,30 @@ private[spark] class CosmosDBSource(sqlContext: SQLContext,
     // in the previous batch. It could be due to node failures or processing failures.
     if (endJson.equals(nextTokens) || endJson.equals(currentTokens)) {
       logDebug(s"Getting data for end offset")
-      val readConfig = Config(
-        streamConfigMap
-          .-(CosmosDBConfig.ChangeFeedContinuationToken)
-          .+((CosmosDBConfig.ChangeFeedContinuationToken, end.json)))
+      val readConfig = if (customSchema.isDefined) {
+        logTrace(s"Getting data for end offset with forcing inferSchema")
+        Config(
+          streamConfigMap
+            .-(CosmosDBConfig.ChangeFeedContinuationToken)
+            .-(CosmosDBConfig.InferStreamSchema)
+            .+((CosmosDBConfig.ChangeFeedContinuationToken, end.json))
+            .+((CosmosDBConfig.InferStreamSchema, "true")))
+      } 
+      else {
+        Config(
+          streamConfigMap
+            .-(CosmosDBConfig.ChangeFeedContinuationToken)
+            .+((CosmosDBConfig.ChangeFeedContinuationToken, end.json)))
+      }
       val currentDf = sqlContext.read.cosmosDB(schema, readConfig, sqlContext)
       currentDf
     } else {
       logDebug(s"Skipping this batch")
-      sqlContext.createDataFrame(sqlContext.emptyDataFrame.rdd, schema)
+      StreamingUtils.createDataFrameStreaming(
+        sqlContext.createDataFrame(sqlContext.emptyDataFrame.rdd, schema),
+        schema,
+        sqlContext)
+
     }
   }
 

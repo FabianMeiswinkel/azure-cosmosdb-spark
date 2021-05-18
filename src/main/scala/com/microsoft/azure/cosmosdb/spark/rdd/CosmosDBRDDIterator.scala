@@ -23,33 +23,42 @@
 package com.microsoft.azure.cosmosdb.spark.rdd
 
 import java.util
+import java.util.Collections
+import java.util.Comparator
 import java.util.concurrent.ConcurrentHashMap
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.microsoft.azure.cosmosdb.internal.HttpConstants.StatusCodes
+import com.microsoft.azure.cosmosdb.internal.directconnectivity.ServiceUnavailableException
 import com.microsoft.azure.cosmosdb.spark.config.{Config, CosmosDBConfig}
 import com.microsoft.azure.cosmosdb.spark.partitioner.CosmosDBPartition
 import com.microsoft.azure.cosmosdb.spark.schema._
 import com.microsoft.azure.cosmosdb.spark.util.HdfsUtils
-import com.microsoft.azure.cosmosdb.spark.{CosmosDBConnection, LoggingTrait}
+import com.microsoft.azure.cosmosdb.spark.{CosmosDBConnection, CosmosDBLoggingTrait}
+import com.microsoft.azure.cosmosdb.spark.ContinuationTokenTrackingIterator
 import com.microsoft.azure.documentdb._
+import com.microsoft.azure.documentdb.internal.HttpConstants.SubStatusCodes
 import org.apache.commons.lang3.StringUtils
 import org.apache.spark._
 import org.apache.spark.sql.sources.Filter
 
 import scala.collection.mutable
+import org.joda.time.DateTimeZone
+import org.joda.time.format.ISODateTimeFormat
 
 object CosmosDBRDDIterator {
 
+  val formatterGMT = ISODateTimeFormat.dateTime().withZone(DateTimeZone.forID("GMT"))
+
   // For verification purpose
   var lastFeedOptions: FeedOptions = _
-
   var hdfsUtils: HdfsUtils = _
 
-  def initializeHdfsUtils(hadoopConfig: Map[String, String]): Any = {
+  def initializeHdfsUtils(hadoopConfig: Map[String, String], changeFeedCheckpointLocation: String): Any = {
     if (hdfsUtils == null) {
       this.synchronized {
         if (hdfsUtils == null) {
-          hdfsUtils = HdfsUtils(hadoopConfig)
+          hdfsUtils = HdfsUtils(hadoopConfig, changeFeedCheckpointLocation)
         }
       }
     }
@@ -70,8 +79,8 @@ object CosmosDBRDDIterator {
     * @return       the corresponding global continuation token
     */
   def getCollectionTokens(config: Config, shouldGetCurrentToken: Boolean = false): String = {
-    val connection = new CosmosDBConnection(config)
-    val collectionLink = connection.collectionLink
+    val connection = CosmosDBConnection(config)
+    val collectionLink = connection.getCollectionLink
     val queryName = config
       .get[String](CosmosDBConfig.ChangeFeedQueryName).get
     var tokenString: String = null
@@ -85,6 +94,7 @@ object CosmosDBRDDIterator {
       nextTokenMap = CosmosDBRDDIterator.hdfsUtils.readChangeFeedToken(
         changeFeedCheckpointLocation,
         if (shouldGetCurrentToken) queryName else getNextTokenPath(queryName),
+        if (shouldGetCurrentToken) getNextTokenPath(queryName) else queryName,
         collectionLink)
     }
 
@@ -126,9 +136,13 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
                           requiredColumns: Array[String],
                           filters: Array[Filter])
   extends Iterator[Document]
-    with LoggingTrait {
+    with CosmosDBLoggingTrait {
 
-  CosmosDBRDDIterator.initializeHdfsUtils(hadoopConfig.toMap)
+  val changeFeedCheckpointLocation: String = config
+    .get[String](CosmosDBConfig.ChangeFeedCheckpointLocation)
+    .getOrElse(StringUtils.EMPTY)
+
+  CosmosDBRDDIterator.initializeHdfsUtils(hadoopConfig.toMap, changeFeedCheckpointLocation)
 
   // The continuation token for the target CosmosDB partition
   private var cfCurrentToken: String = _
@@ -137,10 +151,13 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
   private var closed = false
   private var initialized = false
   private var itemCount: Long = 0
+  private var retryCount: Int = 0
+  private val maxRetryCountOnServiceUnavailable: Int = 100
+  private val rnd = scala.util.Random
 
   lazy val reader: Iterator[Document] = {
     initialized = true
-    var connection: CosmosDBConnection = new CosmosDBConnection(config)
+    val connection: CosmosDBConnection = CosmosDBConnection(config)
 
     val readingChangeFeed: Boolean = config
       .get[String](CosmosDBConfig.ReadChangeFeed)
@@ -197,12 +214,15 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
         .getOrElse(FilterConverter.createQueryString(requiredColumns, filters))
       logInfo(s"CosmosDBRDDIterator::LazyReader, created query string: $queryString")
 
+      var iteratorDocument: Iterator[Document] = Iterator()
+
       if (queryString == FilterConverter.defaultQuery) {
         // If there is no filters, read feed should be used
-        connection.readDocuments(feedOpts)
+        iteratorDocument = connection.readDocuments(feedOpts)
       } else {
-        connection.queryDocuments(queryString, feedOpts)
+        iteratorDocument = connection.queryDocuments(queryString, feedOpts)
       }
+      iteratorDocument
     }
 
     /**
@@ -210,42 +230,75 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
       */
     def readChangeFeed: Iterator[Document] = {
 
-      // For tokens checkpointing
-      var checkPointPath: String = null
       val objectMapper: ObjectMapper = new ObjectMapper()
 
-      val changeFeedCheckpointLocation: String = config
-        .get[String](CosmosDBConfig.ChangeFeedCheckpointLocation)
-        .getOrElse(StringUtils.EMPTY)
-      var changeFeedCheckpoint: Boolean = !changeFeedCheckpointLocation.isEmpty
       val queryName: String = config
         .get[String](CosmosDBConfig.ChangeFeedQueryName)
         .get
       val partitionId = partition.partitionKeyRangeId.toString
-      val collectionLink = connection.collectionLink
+      var parentPartitionId = ""
+
+      // Get the latest parents' partitionId when the child partition has multiple levels of parents
+      // eg: For the given parent hierarchy of ["8","41","89","177"], "177" needs to be picked up
+      if(!partition.parents.isEmpty) {
+        val cmp = new Comparator[String]() {
+          override def compare(str1: String, str2: String): Int = Integer.valueOf(str1).compareTo(Integer.valueOf(str2))
+        }
+        parentPartitionId = Collections.max(partition.parents, cmp)
+      }
+
+      val collectionLink = connection.getCollectionLink
 
       // Initialize the static tokens cache or read it from checkpoint
       def initializeToken(): Unit = {
         cfCurrentToken = CosmosDBRDDIterator.hdfsUtils.readChangeFeedTokenPartition(
           changeFeedCheckpointLocation,
           queryName,
-          collectionLink,
-          partitionId)
-        cfNextToken = CosmosDBRDDIterator.hdfsUtils.readChangeFeedTokenPartition(
-          changeFeedCheckpointLocation,
           CosmosDBRDDIterator.getNextTokenPath(queryName),
           collectionLink,
           partitionId)
-      }
+
+        cfNextToken = CosmosDBRDDIterator.hdfsUtils.readChangeFeedTokenPartition(
+          changeFeedCheckpointLocation,
+          CosmosDBRDDIterator.getNextTokenPath(queryName),
+          queryName,
+          collectionLink,
+          partitionId)
+
+        if(cfCurrentToken.isEmpty && !parentPartitionId.isEmpty) {
+          cfCurrentToken = CosmosDBRDDIterator.hdfsUtils.readChangeFeedTokenPartition(
+            changeFeedCheckpointLocation,
+            queryName,
+            CosmosDBRDDIterator.getNextTokenPath(queryName),
+            collectionLink,
+            parentPartitionId)
+        }
+
+        if(cfNextToken.isEmpty && !parentPartitionId.isEmpty) {
+          cfNextToken = CosmosDBRDDIterator.hdfsUtils.readChangeFeedTokenPartition(
+            changeFeedCheckpointLocation,
+            CosmosDBRDDIterator.getNextTokenPath(queryName),
+            queryName,
+            collectionLink,
+            parentPartitionId)
+        }
+     }
 
       // Get continuation token for the partition with provided partitionId
       def getContinuationToken(partitionId: String): String = {
         val continuationToken = config.get[String](CosmosDBConfig.ChangeFeedContinuationToken)
         if (continuationToken.isDefined) {
-          // Continuaton token is overriden
+          // Continuation token is overridden
           val emptyTokenMap = new ConcurrentHashMap[String, String]()
           val collectionTokenMap = objectMapper.readValue(continuationToken.get, emptyTokenMap.getClass)
           cfCurrentToken = collectionTokenMap.get(partitionId)
+
+          // If the new partition does not have the checkpoint file yet, get the ContinuationToken from its parents' checkpoint file
+          if ((cfCurrentToken == null || cfCurrentToken.isEmpty()) && parentPartitionId != null && !parentPartitionId.isEmpty()) {
+            cfCurrentToken = collectionTokenMap.get(parentPartitionId)
+            logInfo(s"Null ContinuationToken for PartitionId: $partitionId. Latest Parent-PartitionId: $parentPartitionId. + " +
+              s"CurrentToken for latest Parent-PartitionId: $cfCurrentToken")
+          }
         } else {
           // Set the current token to next token for the target collection
           val useNextToken: Boolean = config
@@ -261,9 +314,7 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
       }
 
       // Update the tokens cache as appropriate
-      def updateTokens(currentToken: String,
-                       nextToken: String,
-                       partitionId: String): Unit = {
+      def updateTokens(nextToken: String, partitionId: String): Unit = {
         val rollingChangeFeed: Boolean = config
           .get[String](CosmosDBConfig.RollingChangeFeed)
           .getOrElse(CosmosDBConfig.DefaultRollingChangeFeed.toString)
@@ -300,11 +351,20 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
         .get[String](CosmosDBConfig.ChangeFeedStartFromTheBeginning)
         .getOrElse(CosmosDBConfig.DefaultChangeFeedStartFromTheBeginning.toString)
         .toBoolean
+
+      val startFromDateTime: String = config
+        .getOrElse[String](CosmosDBConfig.ChangeFeedStartFromDateTime, "")
+
       val currentToken: String = getContinuationToken(partitionId)
 
       val changeFeedOptions: ChangeFeedOptions = new ChangeFeedOptions()
       changeFeedOptions.setPartitionKeyRangeId(partition.partitionKeyRangeId.toString)
       changeFeedOptions.setStartFromBeginning(startFromTheBeginning)
+      if (StringUtils.isNotBlank(startFromDateTime)) {
+        val startFromDateTimeParsed = CosmosDBRDDIterator.formatterGMT.parseDateTime(startFromDateTime);
+        changeFeedOptions.setStartDateTime(startFromDateTimeParsed)
+      }
+
       if (currentToken != null && !currentToken.isEmpty) {
         changeFeedOptions.setRequestContinuation(currentToken)
       }
@@ -320,17 +380,71 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
         .getOrElse(CosmosDBConfig.DefaultInferStreamSchema.toString)
         .toBoolean
 
-      // Query for change feed
-      val response = connection.readChangeFeed(changeFeedOptions, structuredStreaming, shouldInferStreamSchema)
-      val iteratorDocument = response._1
-      val nextToken = response._2
+      var iteratorDocument: Iterator[Document] = Iterator()
+      var isGone: Boolean = false
+      var successReadChangeFeed: Boolean = false
 
-      updateTokens(currentToken, nextToken, partitionId)
-
-      logDebug(s"changeFeedOptions.partitionKeyRangeId = ${changeFeedOptions.getPartitionKeyRangeId}, continuation = $currentToken, new token = ${response._2}, iterator.hasNext = ${response._1.hasNext}")
-
+      while(!successReadChangeFeed && retryCount < maxRetryCountOnServiceUnavailable && !isGone) {
+        // Query for change feed
+        try {
+          iteratorDocument = connection.readChangeFeed(changeFeedOptions, structuredStreaming, shouldInferStreamSchema, (currentToken: String, nextToken: String, partitionId: String) => updateTokens(nextToken, partitionId))
+          successReadChangeFeed = true
+        }
+        catch {
+          case docEx: DocumentClientException => handleGoneException(connection, docEx)
+          case ex: IllegalStateException =>
+            ex.getCause match {
+              case _: ServiceUnavailableException =>
+                if (retryCount < maxRetryCountOnServiceUnavailable) {
+                  val retryDelayInMs = rnd.nextInt(1000)
+                  logWarning(s"Service Unavailable exception thrown. Going to retry. " +
+                    s"Current retry count: $retryCount. Max retry count: $maxRetryCountOnServiceUnavailable " +
+                    s"Retry Delay (ms): $retryDelayInMs")
+                  Thread.sleep(retryDelayInMs)
+                  retryCount += 1
+                } else {
+                  logError("Exhausted all retries on Service Unavailable exception")
+                  throw ex
+                }
+              case _ => ex.getCause match {
+                case docEx: DocumentClientException =>
+                  handleGoneException(connection, docEx)
+                  isGone = true
+                case _ =>
+                  logError(s"An IllegalStateException was thrown: ${ex.getMessage}")
+              }
+            }
+          case ex: Throwable =>
+            logError(s"UNHANDLED EXCEPTION: ${ex.getMessage}")
+            throw ex
+        }
+      }
       iteratorDocument
     }
+
+    taskContext.addTaskFailureListener((_: TaskContext, ex: Throwable) => {
+      logError("Handling Task Failure")
+      ex match {
+        case dcx: DocumentClientException =>
+          if (dcx.getStatusCode == StatusCodes.SERVICE_UNAVAILABLE) {
+            logError("Service Unavailable")
+            connection.reinitializeClient()
+          }
+        case _: IllegalStateException if ex.getCause != null && ex.getCause.isInstanceOf[DocumentClientException] => {
+          val dcx: DocumentClientException = ex.getCause.asInstanceOf[DocumentClientException]
+          logError(s"Illegal State Exception with StatusCode ${dcx.getStatusCode}")
+          if (dcx.getStatusCode == StatusCodes.SERVICE_UNAVAILABLE) {
+            connection.reinitializeClient()
+          }
+        }
+        case genericThrowable: Throwable => logError(s"Unspecific error ${genericThrowable.getMessage}")
+      }
+    })
+
+    // Register an on-task-completion callback to close the input stream.
+    taskContext.addTaskCompletionListener((_: TaskContext) => {
+      closeIfNeeded()
+    })
 
     if (!readingChangeFeed) {
       queryDocuments
@@ -339,8 +453,25 @@ class CosmosDBRDDIterator(hadoopConfig: mutable.Map[String, String],
     }
   }
 
-  // Register an on-task-completion callback to close the input stream.
-  taskContext.addTaskCompletionListener((context: TaskContext) => closeIfNeeded())
+  private def handleGoneException(connection: CosmosDBConnection, exception: DocumentClientException): Unit = {
+    if (exception.getStatusCode == StatusCodes.SERVICE_UNAVAILABLE
+      || exception.getSubStatusCode == SubStatusCodes.PARTITION_KEY_RANGE_GONE
+      || exception.getSubStatusCode == SubStatusCodes.COMPLETING_SPLIT)
+    {
+      val retryDelayInMs = rnd.nextInt(1000)
+
+      logWarning(
+        s"STREAMING EXCEPTION: Partition ${partition.partitionKeyRangeId} is splitting, " +
+        s"status code ${exception.getStatusCode}, subStatus ${exception.getSubStatusCode} " +
+        s"Retry delay (ms): $retryDelayInMs")
+      Thread.sleep(retryDelayInMs)
+      connection.reinitializeClient()
+    } else {
+      logWarning(s"UNHANDLED STREAMING EXCEPTION: ${exception.getMessage} " +
+        s"${exception.getStatusCode} ${exception.getSubStatusCode}")
+      throw exception
+    }
+  }
 
   override def hasNext: Boolean = {
     if (maxItems != null && maxItems.isDefined && maxItems.get <= itemCount) {

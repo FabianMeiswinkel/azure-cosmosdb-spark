@@ -20,20 +20,11 @@
   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   * SOFTWARE.
   */
-package com.microsoft.azure.cosmosdb.spark
+package com.microsoft.azure.cosmosdb.spark.streaming
 
-import com.microsoft.azure.cosmosdb.spark.config.Config
-import com.microsoft.azure.documentdb.Document
+import com.microsoft.azure.cosmosdb.Document
 
-class ADLPartitionIterator(config: Config, adlFilePartition: ADLFilePartition) extends Iterator[Document] {
-
-  private lazy val reader: java.util.Iterator[Document] = {
-    val adlConnection = ADLConnection(config)
-    val items = adlConnection.readAdlFile(adlFilePartition.adlFilePath)
-    items.iterator()
-  }
-
-  override def hasNext: Boolean = reader.hasNext
-
-  override def next(): Document = reader.next()
+trait CosmosDBWriteStreamPoisonMessageNotificationHandler
+{
+    def onPoisonMessage(lastError: Throwable,  document: Document)
 }

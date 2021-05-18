@@ -22,6 +22,9 @@
   */
 package com.microsoft.azure.cosmosdb.spark
 
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.nio.charset.Charset
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -31,12 +34,11 @@ import com.microsoft.azure.cosmosdb.spark.schema._
 import com.microsoft.azure.cosmosdb.spark.util.HdfsUtils
 import rx.Observable
 import com.microsoft.azure.documentdb._
-import com.microsoft.azure.documentdb.bulkexecutor.{DocumentBulkExecutor, BulkImportResponse, BulkUpdateResponse, UpdateItem}
+import com.microsoft.azure.documentdb.bulkexecutor.{BulkImportResponse, BulkUpdateResponse, DocumentBulkExecutor, UpdateItem}
 import org.apache.spark.{Partition, SparkContext}
 import org.apache.spark.api.java.{JavaRDD, JavaSparkContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
-import org.apache.spark.sql.execution.datasources.FilePartition
 import org.apache.spark.sql.types.StructType
 
 import scala.collection.JavaConverters._
@@ -45,18 +47,19 @@ import scala.collection.mutable.ListBuffer
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe._
 import scala.util.Random
+import scala.collection.JavaConversions._
 
 /**
   * The CosmosDBSpark allow fast creation of RDDs, DataFrames or Datasets from CosmosDBSpark.
   *
   * @since 1.0
   */
-object CosmosDBSpark extends LoggingTrait {
+object CosmosDBSpark extends CosmosDBLoggingTrait {
 
   /**
    * The default source string for creating DataFrames from CosmosDB
    */
-  val defaultSource = classOf[DefaultSource].getCanonicalName
+  val defaultSource: String = classOf[DefaultSource].getCanonicalName
 
   /**
     * For verfication purpose
@@ -133,90 +136,86 @@ object CosmosDBSpark extends LoggingTrait {
   def save[D: ClassTag](rdd: RDD[D]): Unit = save(rdd, Config(rdd.sparkContext))
 
   /**
-    * Save data to CosmosDB
-    *
-    * @param rdd         the RDD data to save to CosmosDB
-    * @param writeConfig the writeConfig
-    * @tparam D the type of the data in the RDD
-    */
+   * Save data to CosmosDB
+   *
+   * @param rdd         the RDD data to save to CosmosDB
+   * @param writeConfig the writeConfig
+   * @tparam D the type of the data in the RDD
+   */
   def save[D: ClassTag](rdd: RDD[D], writeConfig: Config): Unit = {
     var numPartitions = 0
+    var rddNumPartitions = 0
     try {
       numPartitions = rdd.getNumPartitions
+      rddNumPartitions = numPartitions
     } catch {
       case _: Throwable => // no op
     }
 
-    // Check if we're writing ADLPartition/FilePartition
-    var isWritingAdlPartition = false
-    var isWritingFilePartition = false
-    var partitionMap = mutable.Map[Int, Partition]()
-    try {
-      // The .partitions call can throw NullRef for non-parallel RDD
-      val partitions = rdd.partitions
-      isWritingAdlPartition = partitions.length > 0 && partitions(0).isInstanceOf[ADLFilePartition]
-      isWritingFilePartition = partitions.length > 0 && partitions(0).isInstanceOf[FilePartition]
-      if (isWritingAdlPartition || isWritingFilePartition) {
-        partitions.foreach(p => {
-          partitionMap = partitionMap + (p.index -> p)
-        })
+    val maxMiniBatchImportSizeKB: Int = writeConfig
+      .get[String](CosmosDBConfig.MaxMiniBatchImportSizeKB)
+      .getOrElse(CosmosDBConfig.DefaultMaxMiniBatchImportSizeKB.toString)
+      .toInt
+
+    val writeThroughputBudget : Option[Int] = writeConfig
+      .get[String](CosmosDBConfig.WriteThroughputBudget)
+      .map(_.toInt)
+
+    var writeThroughputBudgetPerCosmosPartition: Option[Int] = None
+    var baseMaxMiniBatchImportSizeKB: Int = maxMiniBatchImportSizeKB
+
+    // if writeThroughputBudget is provided in config, derive baseMaxMiniBatchImportSize based on #sparkPartitions & baseMiniBatchRUConsumption value
+    if (writeThroughputBudget.exists(_ > 0)) {
+      val baseMiniBatchRUConsumption: Int = writeConfig
+        .get[String](CosmosDBConfig.BaseMiniBatchRUConsumption)
+        .getOrElse(CosmosDBConfig.DefaultBaseMiniBatchRUConsumption.toString)
+        .toInt
+
+      val maxIngestionTaskParallelism: Option[Int] = writeConfig
+        .get[String](CosmosDBConfig.MaxIngestionTaskParallelism)
+        .map(_.toInt)
+
+      // If the maxIngestionTaskParallelism was provided, use it for baseMaxMiniBatchImportSize derivation.
+      // If the df has 100 spark partitions and the spark cluster has only 32 cores, the max task parallelism is 32.
+      // In this case, users can set maxIngestionTaskParallelism to 32 and will help with the RU consumption based on writeThroughputBudget.
+      if (maxIngestionTaskParallelism.exists(_ > 0)) numPartitions = maxIngestionTaskParallelism.get
+
+      val cosmosPartitionsCount = CosmosDBConnection(writeConfig).getAllPartitions.length
+      // writeThroughputBudget per cosmos db physical partition
+      writeThroughputBudgetPerCosmosPartition = Some((writeThroughputBudget.get / cosmosPartitionsCount).ceil.toInt)
+      val baseMiniBatchSizeAdjustmentFactor: Double = (baseMiniBatchRUConsumption.toDouble * numPartitions) / writeThroughputBudgetPerCosmosPartition.get
+      if (maxMiniBatchImportSizeKB >= baseMiniBatchSizeAdjustmentFactor) {
+        baseMaxMiniBatchImportSizeKB = (maxMiniBatchImportSizeKB / baseMiniBatchSizeAdjustmentFactor).ceil.toInt
+      } else {
+        // In the rare case of very high #sparkPartitions and very low writeThroughputBudget, derived baseMaxMiniBatchImportSize could be < 1.
+        // In this case, the #sparkPartitions needs to be adjusted to limit the RU consumption with the provided writeThroughputBudget
+        baseMaxMiniBatchImportSizeKB = 1
+        numPartitions = ((maxMiniBatchImportSizeKB * writeThroughputBudgetPerCosmosPartition.get) / baseMiniBatchRUConsumption).ceil.toInt
       }
-    } catch {
-      case _: Throwable => // no op
     }
 
-    val hadoopConfig = HdfsUtils.getConfigurationMap(rdd.sparkContext.hadoopConfiguration).toMap
-
-    // Use min(writeThroughputBudget, collectionThroughput) - utilized only in bulk import
-    val connection: CosmosDBConnection = new CosmosDBConnection(writeConfig)
-    var collectionThroughput: Int = 0
-    collectionThroughput = connection.getCollectionThroughput
-
-    val writeThroughputBudget = writeConfig.get[String](CosmosDBConfig.WriteThroughputBudget)
-    var offerThroughput: Int = collectionThroughput
-    if (writeThroughputBudget.isDefined) {
-      offerThroughput = Math.min(writeThroughputBudget.get.toInt, collectionThroughput)
+    val mapRdd = if (numPartitions < rddNumPartitions && numPartitions > 0) {
+      rdd.coalesce(numPartitions).mapPartitions(savePartition(_, writeConfig, numPartitions,
+        baseMaxMiniBatchImportSizeKB * 1024, writeThroughputBudgetPerCosmosPartition), preservesPartitioning = true)
+    } else {
+      rdd.mapPartitions(savePartition(_, writeConfig, numPartitions,
+        baseMaxMiniBatchImportSizeKB * 1024, writeThroughputBudgetPerCosmosPartition), preservesPartitioning = true)
     }
 
-    logInfo("Write config: " + writeConfig.toString)
-
-    val mapRdd = rdd.mapPartitionsWithIndex((partitionId, iter) =>
-      if (isWritingAdlPartition) {
-        val adlPartition = partitionMap(partitionId).asInstanceOf[ADLFilePartition]
-        saveAdlPartition(iter, writeConfig, numPartitions, adlPartition.adlFilePath, hadoopConfig, offerThroughput)
-      } else if (isWritingFilePartition) {
-        val filePartition = partitionMap(partitionId).asInstanceOf[FilePartition]
-        saveFilePartition(iter, writeConfig, numPartitions, filePartition, hadoopConfig, offerThroughput)
-      }
-      else
-        savePartition(iter, writeConfig, numPartitions, offerThroughput), preservesPartitioning = true)
     mapRdd.collect()
-
-//    // All tasks have been completed, clean up the file checkpoints
-//    val adlCheckpointPath = writeConfig.get[String](CosmosDBConfig.adlFileCheckpointPath)
-//    if (adlCheckpointPath.isDefined) {
-//      val hdfsUtils = new HdfsUtils(hadoopConfig)
-//      ADLConnection.cleanUpProgress(hdfsUtils, adlCheckpointPath.get)
-//    }
   }
 
   private def bulkUpdate[D: ClassTag](iter: Iterator[D],
                                       connection: CosmosDBConnection,
-                                      offerThroughput: Int,
-                                      writingBatchSize: Int,
-                                      partitionKeyDefinition: Option[String])(implicit ev: ClassTag[D]): Unit = {
-
-    // Set retry options high for initialization (default values)
-    connection.setDefaultClientRetryPolicy
-
+                                      writingBatchSize: Int)(implicit ev: ClassTag[D]): Unit = {
     // Initialize BulkExecutor
-    val updater: DocumentBulkExecutor = connection.getDocumentBulkImporter(offerThroughput, partitionKeyDefinition)
+    val updater: DocumentBulkExecutor = connection.getDocumentBulkImporter
 
     // Set retry options to 0 to pass control to BulkExecutor
     // connection.setZeroClientRetryPolicy
-
     val updateItems = new java.util.ArrayList[UpdateItem](writingBatchSize)
     val updatePatchItems = new java.util.ArrayList[Document](writingBatchSize)
+    val cosmosDBRowConverter = new CosmosDBRowConverter(SerializationConfig.fromConfig(connection.config))
 
     var bulkUpdateResponse: BulkUpdateResponse = null
     iter.foreach(item => {
@@ -226,57 +225,98 @@ object CosmosDBSpark extends LoggingTrait {
         case doc: Document =>
           updatePatchItems.add(doc)
         case row: Row =>
-          updatePatchItems.add(new Document(CosmosDBRowConverter.rowToJSONObject(row).toString()))
+          updatePatchItems.add(new Document(cosmosDBRowConverter.rowToJSONObject(row).toString()))
         case _ => throw new Exception("Unsupported update item types")
       }
       if (updateItems.size() >= writingBatchSize) {
         bulkUpdateResponse = updater.updateAll(updateItems, null)
-        if (!bulkUpdateResponse.getErrors.isEmpty) {
-          throw new Exception("Errors encountered in bulk update API execution. Exceptions observed:\n" + bulkUpdateResponse.getErrors.toString)
-        }
         updateItems.clear()
       }
       if (updatePatchItems.size() >= writingBatchSize) {
         bulkUpdateResponse = updater.mergeAll(updatePatchItems, null)
+        updatePatchItems.clear()
+      }
+
+      if (bulkUpdateResponse != null) {
+        if (bulkUpdateResponse.getFailedUpdates.size() > 0) {
+          throw toFailedUpdateException(bulkUpdateResponse)
+        }
+
         if (!bulkUpdateResponse.getErrors.isEmpty) {
           throw new Exception("Errors encountered in bulk update API execution. Exceptions observed:\n" + bulkUpdateResponse.getErrors.toString)
         }
-        updatePatchItems.clear()
       }
     })
     if (updateItems.size() > 0) {
       bulkUpdateResponse = updater.updateAll(updateItems, null)
-      if (!bulkUpdateResponse.getErrors.isEmpty) {
-        throw new Exception("Errors encountered in bulk update API execution. Exceptions observed:\n" + bulkUpdateResponse.getErrors.toString)
-      }
     }
     if (updatePatchItems.size() > 0) {
       bulkUpdateResponse = updater.mergeAll(updatePatchItems, null)
+    }
+
+    if (bulkUpdateResponse != null) {
+      if (bulkUpdateResponse.getFailedUpdates.size() > 0) {
+        throw toFailedUpdateException(bulkUpdateResponse)
+      }
+
       if (!bulkUpdateResponse.getErrors.isEmpty) {
         throw new Exception("Errors encountered in bulk update API execution. Exceptions observed:\n" + bulkUpdateResponse.getErrors.toString)
       }
     }
   }
 
+  private def getDocumentsDebugString(
+    connection: CosmosDBConnection,
+    docs: java.util.List[String]): String =
+  {
+    val pkDefinitionModel = connection.getPartitionKeyDefinition
+
+    logDebug(s"PartitionKeyDefinition: Kind: ${pkDefinitionModel.getKind.toString}")
+    val version = pkDefinitionModel.getVersion
+    if (version != null)
+    {
+      logDebug(s"PartitionKeyDefinition: Version: ${version.toString}")
+    }
+    logDebug(s"PartitionKeyDefinition: Paths - ${pkDefinitionModel.getPaths.mkString("|")}")
+
+    val sb = new StringBuilder()
+    docs.foreach(d =>
+      {
+        val doc : String = d.toString
+        val internalPK = com.microsoft.azure.documentdb.bulkexecutor.internal.DocumentAnalyzer
+          .extractPartitionKeyValue(doc, pkDefinitionModel)
+        val effectivePK = internalPK
+          .getEffectivePartitionKeyString(pkDefinitionModel, true)
+        val jsonPK = internalPK
+          .toJson
+        sb.append(jsonPK).append("(").append(effectivePK).append(") --> ").append(doc).append(", ")
+      }
+    )
+    sb.toString()
+  }
+
   private def bulkImport[D: ClassTag](iter: Iterator[D],
                                       connection: CosmosDBConnection,
-                                      offerThroughput: Int,
                                       writingBatchSize: Int,
                                       rootPropertyToSave: Option[String],
-                                      partitionKeyDefinition: Option[String],
                                       upsert: Boolean,
-                                      maxConcurrencyPerPartitionRange: Integer): Unit = {
-
-    // Set retry options high for initialization (default values)
-    connection.setDefaultClientRetryPolicy
-
+                                      maxConcurrencyPerPartitionRange: Integer,
+                                      partitionCount: Int,
+                                      baseMaxMiniBatchImportSize: Int,
+                                      writeThroughputBudgetPerCosmosPartition: Option[Int]): Unit = {
     // Initialize BulkExecutor
-    val importer: DocumentBulkExecutor = connection.getDocumentBulkImporter(offerThroughput, partitionKeyDefinition)
+    val importer: DocumentBulkExecutor = connection.getDocumentBulkImporter
 
     // Set retry options to 0 to pass control to BulkExecutor
     // connection.setZeroClientRetryPolicy
 
     val documents = new java.util.ArrayList[String](writingBatchSize)
+    val cosmosDBRowConverter = new CosmosDBRowConverter(SerializationConfig.fromConfig(connection.config))
+
+    var budgetEvalSize: Double = 0
+    var isBudgetEvalComplete: Boolean = !writeThroughputBudgetPerCosmosPartition.exists(_ > 0)
+    var effectiveMaxMiniBatchImportSize: Int = baseMaxMiniBatchImportSize
+    val effectivewriteThroughputBudgetPerCosmosPartition: Int = writeThroughputBudgetPerCosmosPartition.getOrElse(0)
 
     var bulkImportResponse: BulkImportResponse = null
     iter.foreach(item => {
@@ -286,7 +326,7 @@ object CosmosDBSpark extends LoggingTrait {
           if (rootPropertyToSave.isDefined) {
             new Document(row.getString(row.fieldIndex(rootPropertyToSave.get)))
           } else {
-            new Document(CosmosDBRowConverter.rowToJSONObject(row).toString())
+            new Document(cosmosDBRowConverter.rowToJSONObject(row).toString())
           }
         case any => new Document(any.toString)
       }
@@ -294,127 +334,125 @@ object CosmosDBSpark extends LoggingTrait {
         document.setId(UUID.randomUUID().toString)
       }
       documents.add(document.toJson())
-      if (documents.size() >= writingBatchSize) {
-        bulkImportResponse = importer.importAll(documents, upsert, false, maxConcurrencyPerPartitionRange)
+
+      // An initial one-time bulk import is performed with the baseMaxMiniBatchImportSize and the RU consumption is collected.
+      // This will take into consideration the indexed vs non-indexed target container, size of the imported docs etc:
+      // The miniBatchSizeAdjustmentFactor is calculated based on the above RU consumption and the effective minibatch size is adjusted based on this.
+      if (writeThroughputBudgetPerCosmosPartition.exists(_ > 0) && !isBudgetEvalComplete) {
+        budgetEvalSize += document.toJson().getBytes(Charset.forName("UTF-8")).length
+        if (budgetEvalSize >= baseMaxMiniBatchImportSize ) {
+          bulkImportResponse = importer.importAll(documents, upsert, false, maxConcurrencyPerPartitionRange,
+            baseMaxMiniBatchImportSize, partitionCount, effectivewriteThroughputBudgetPerCosmosPartition)
+          if (!bulkImportResponse.getErrors.isEmpty) {
+            throw new Exception("Errors encountered in bulk import API execution. Exceptions observed:\n" + bulkImportResponse.getErrors.toString)
+          }
+          if (!bulkImportResponse.getBadInputDocuments.isEmpty) {
+            throw new Exception("Bad input documents provided to bulk import API. Bad input documents observed:\n" + bulkImportResponse.getBadInputDocuments.toString)
+          }
+          if (bulkImportResponse.getFailedImports.size() > 0) {
+            throw toFailedImportException(bulkImportResponse, connection)
+          }
+
+          val requestUnitsConsumed = bulkImportResponse.getTotalRequestUnitsConsumed
+          val miniBatchSizeAdjustmentFactor = (requestUnitsConsumed * partitionCount) / effectivewriteThroughputBudgetPerCosmosPartition
+          effectiveMaxMiniBatchImportSize = (baseMaxMiniBatchImportSize / miniBatchSizeAdjustmentFactor).ceil.toInt
+          isBudgetEvalComplete = true
+          documents.clear()
+        }
+      }
+
+      if (documents.size() >= writingBatchSize && isBudgetEvalComplete) {
+        bulkImportResponse = importer.importAll(documents, upsert, false, maxConcurrencyPerPartitionRange,
+          effectiveMaxMiniBatchImportSize, partitionCount, effectivewriteThroughputBudgetPerCosmosPartition)
         if (!bulkImportResponse.getErrors.isEmpty) {
           throw new Exception("Errors encountered in bulk import API execution. Exceptions observed:\n" + bulkImportResponse.getErrors.toString)
         }
         if (!bulkImportResponse.getBadInputDocuments.isEmpty) {
           throw new Exception("Bad input documents provided to bulk import API. Bad input documents observed:\n" + bulkImportResponse.getBadInputDocuments.toString)
         }
+        if (bulkImportResponse.getFailedImports.size() > 0) {
+          throw toFailedImportException(bulkImportResponse, connection)
+        }
         documents.clear()
       }
     })
     if (documents.size() > 0) {
-      bulkImportResponse = importer.importAll(documents, upsert, false, maxConcurrencyPerPartitionRange)
+      bulkImportResponse = importer.importAll(documents, upsert, false, maxConcurrencyPerPartitionRange,
+        effectiveMaxMiniBatchImportSize, partitionCount, effectivewriteThroughputBudgetPerCosmosPartition)
       if (!bulkImportResponse.getErrors.isEmpty) {
         throw new Exception("Errors encountered in bulk import API execution. Exceptions observed:\n" + bulkImportResponse.getErrors.toString)
       }
       if (!bulkImportResponse.getBadInputDocuments.isEmpty) {
         throw new Exception("Bad input documents provided to bulk import API. Bad input documents observed:\n" + bulkImportResponse.getBadInputDocuments.toString)
       }
+      if (bulkImportResponse.getFailedImports.size() > 0) {
+        throw toFailedImportException(bulkImportResponse, connection)
+      }
     }
   }
 
+  private def toFailedImportException(response: BulkImportResponse, connection: CosmosDBConnection) : Exception = {
 
-  private def saveFilePartition[D: ClassTag](iter: Iterator[D],
-                                              config: Config,
-                                              partitionCount: Int,
-                                              filePartition: FilePartition,
-                                              hadoopConfig: Map[String, String],
-                                              offerThroughput: Int): Iterator[D] = {
-    val connection = new CosmosDBConnection(config)
+    val failedImport = response.getFailedImports.get(0)
+    val failure = failedImport.getBulkImportFailureException
 
-    // Check the status of the files
-    val writingBatchId = config.get[String](CosmosDBConfig.WritingBatchId)
-    val adlCheckpointPath = config.get[String](CosmosDBConfig.adlFileCheckpointPath)
-    var hdfsUtils: HdfsUtils = null
-    if (adlCheckpointPath.isDefined) {
-      hdfsUtils = new HdfsUtils(hadoopConfig)
-    }
-    val fileStoreCollection = config.get[String](CosmosDBConfig.CosmosDBFileStoreCollection)
-    var dbName: String = null
-    var collectionLink: String = null
-    if (fileStoreCollection.isDefined) {
-      dbName = config.get[String](CosmosDBConfig.Database).get
-      collectionLink = s"/dbs/$dbName/colls/${fileStoreCollection.get}"
-    }
+    val failedImportDocs = getDocumentsDebugString(
+        connection,
+        failedImport.getDocumentsFailedToImport)
 
-    var processedFileCount = 0
-    filePartition.files.foreach(file => {
-      var isProcessed = false
-      if (adlCheckpointPath.isDefined) {
-        isProcessed = ADLConnection.isAdlFileProcessed(hdfsUtils, adlCheckpointPath.get, file.filePath, writingBatchId.get)
-      } else if (fileStoreCollection.isDefined) {
-        isProcessed = ADLConnection.isAdlFileProcessed(connection, collectionLink, file.filePath, writingBatchId.get)
-      }
-      processedFileCount = processedFileCount + (if (isProcessed) 1 else 0)
-    })
-    if (processedFileCount == filePartition.files.size) {
-      new ListBuffer().iterator
-    } else {
-      val iterator = savePartition(connection, iter, config, partitionCount, offerThroughput)
+    val failureWithCallstack = getExceptionWithCallstack(failure)
+        
+    val message = "Errors encountered in bulk import API execution. " +
+      "PartitionKeyDefinition: " + connection.getPartitionKeyDefinition + ", " +
+      "Number of failures corresponding to exception of type: " +
+      failure.getClass.getName + " = " +
+      failedImport.getDocumentsFailedToImport.size() + "; " +
+      "FAILURE: " + failureWithCallstack  + "; " +
+      "DOCUMENT FAILED TO IMPORT: " + failedImportDocs
 
-      // Mark the file on this partition as processed
-      // Todo: refactor this part
+    logError(message)
 
-      if (adlCheckpointPath.isDefined) {
-        filePartition.files.foreach(file =>
-          ADLConnection.markAdlFileProcessed(hdfsUtils, adlCheckpointPath.get, file.filePath, writingBatchId.get))
-      } else {
-        if (fileStoreCollection.isDefined) {
-          filePartition.files.foreach(file =>
-            ADLConnection.markAdlFileStatus(connection, collectionLink, file.filePath, writingBatchId.get, isInProgress = false, isComplete = true))
-        }
-      }
-
-      iterator
-    }
+    new Exception(message)
   }
 
-  private def saveAdlPartition[D: ClassTag](iter: Iterator[D],
-                                            config: Config,
-                                            partitionCount: Int,
-                                            adlFilePath: String,
-                                            hadoopConfig: Map[String, String],
-                                            offerThroughput: Int): Iterator[D] = {
-    val connection = new CosmosDBConnection(config)
-    val iterator = savePartition(connection, iter, config, partitionCount, offerThroughput)
+  private def getExceptionWithCallstack(throwable: Throwable) : String = {
+    val sw = new StringWriter
+    val pw = new PrintWriter(sw)
+    throwable.printStackTrace(pw)
+    pw.flush()
+    val failureWithCallstack = sw.toString()
+    pw.close()
 
-    // Mark the adlFile on this partition as processed
-    // Todo: refactor this part
-    val adlCheckpointPath = config.get[String](CosmosDBConfig.adlFileCheckpointPath)
-    val writingBatchId = config.get[String](CosmosDBConfig.WritingBatchId)
-    if (adlCheckpointPath.isDefined) {
-      val hdfsUtils = new HdfsUtils(hadoopConfig)
-      ADLConnection.markAdlFileProcessed(hdfsUtils, adlCheckpointPath.get, adlFilePath, writingBatchId.get)
-    } else {
-      val aldFileStoreCollection = config.get[String](CosmosDBConfig.CosmosDBFileStoreCollection)
-      if (aldFileStoreCollection.isDefined) {
-        val dbName = config.get[String](CosmosDBConfig.Database).get
-        val collectionLink = s"/dbs/$dbName/colls/${aldFileStoreCollection.get}"
-        ADLConnection.markAdlFileStatus(connection, collectionLink, adlFilePath, writingBatchId.get, isInProgress = false, isComplete = true)
-      }
-    }
+    failureWithCallstack
+  }
 
-    iterator
+  private def toFailedUpdateException(response: BulkUpdateResponse) : Exception = {
+    val failedUpdate = response.getFailedUpdates.get(0)
+    val failure = failedUpdate.getBulkUpdateFailureException
+
+    val failedUpdateIds = failedUpdate.getFailedUpdateItems.map(_.getId)
+    val failedUpdatePKValues = failedUpdate.getFailedUpdateItems.map(_.getPartitionKeyValue)
+    val failedUpdateIdPKValuesList = failedUpdateIds.zip(failedUpdatePKValues).toList.mkString(", ")
+
+    val failureWithCallstack = getExceptionWithCallstack(failure)
+
+    val message = "Errors encountered in bulk update API execution. " +
+      "Number of failures corresponding to exception of type: " +
+      failure.getClass.getName + " = " + failedUpdate.getFailedUpdateItems.size + "; " +
+      "FAILURE: " + failureWithCallstack + "; " +
+      "The global identifier (id, pk) tuples of the failed updates are: " + failedUpdateIdPKValuesList
+
+    logError(message)
+
+    new Exception(message)
   }
 
   private def savePartition[D: ClassTag](iter: Iterator[D],
                                          config: Config,
                                          partitionCount: Int,
-                                         offerThroughput: Int): Iterator[D] = {
-    val connection = new CosmosDBConnection(config)
-    savePartition(connection, iter, config, partitionCount, offerThroughput)
-  }
-
-  private def savePartition[D: ClassTag](connection: CosmosDBConnection,
-                                          iter: Iterator[D],
-                                          config: Config,
-                                          partitionCount: Int,
-                                          offerThroughput: Int): Iterator[D] = {
-
-    val connection:CosmosDBConnection = new CosmosDBConnection(config)
+                                         baseMaxMiniBatchImportSize: Int,
+                                         writeThroughputBudgetPerCosmosPartition: Option[Int]): Iterator[D] = {
+    val connection: CosmosDBConnection = CosmosDBConnection(config)
     val asyncConnection: AsyncCosmosDBConnection = new AsyncCosmosDBConnection(config)
 
     val isBulkImporting = config.get[String](CosmosDBConfig.BulkImport).
@@ -440,20 +478,10 @@ object CosmosDBSpark extends LoggingTrait {
     val isBulkUpdating = config.get[String](CosmosDBConfig.BulkUpdate).
       getOrElse(CosmosDBConfig.DefaultBulkUpdate.toString).
       toBoolean
-    val clientInitDelay = config.get[String](CosmosDBConfig.ClientInitDelay).
-      getOrElse(CosmosDBConfig.DefaultClientInitDelay.toString).
-      toInt
-    val partitionKeyDefinition = config
-      .get[String](CosmosDBConfig.PartitionKeyDefinition)
 
-    val maxConcurrencyPerPartitionRangeStr = config.get[String](CosmosDBConfig.BulkImportMaxConcurrencyPerPartitionRange)
-    val maxConcurrencyPerPartitionRange = if (maxConcurrencyPerPartitionRangeStr.nonEmpty)
-      Integer.valueOf(maxConcurrencyPerPartitionRangeStr.get) else null
-
-    // Delay the start as the number of tasks grow to avoid throttling at initialization
-    val maxDelaySec: Int = (partitionCount / clientInitDelay) + (if (partitionCount % clientInitDelay > 0) 1 else 0)
-    if (maxDelaySec > 0)
-      TimeUnit.SECONDS.sleep(random.nextInt(maxDelaySec))
+    val maxConcurrencyPerPartitionRange = config
+      .getOrElse[String](CosmosDBConfig.BulkImportMaxConcurrencyPerPartitionRange, String.valueOf(CosmosDBConfig.DefaultBulkImportMaxConcurrencyPerPartitionRange))
+      .toInt
 
     CosmosDBSpark.lastUpsertSetting = Some(upsert)
     CosmosDBSpark.lastWritingBatchSize = Some(writingBatchSize)
@@ -461,11 +489,19 @@ object CosmosDBSpark extends LoggingTrait {
     if (iter.nonEmpty) {
       if (isBulkUpdating) {
         logDebug(s"Writing partition with bulk update")
-        bulkUpdate(iter, connection, offerThroughput, writingBatchSize, partitionKeyDefinition)
+        bulkUpdate(iter, connection, writingBatchSize)
       } else if (isBulkImporting) {
         logDebug(s"Writing partition with bulk import")
-        bulkImport(iter, connection, offerThroughput, writingBatchSize, rootPropertyToSave,
-          partitionKeyDefinition, upsert, maxConcurrencyPerPartitionRange)
+        bulkImport(
+          iter,
+          connection,
+          writingBatchSize,
+          rootPropertyToSave,
+          upsert,
+          maxConcurrencyPerPartitionRange,
+          partitionCount,
+          baseMaxMiniBatchImportSize,
+          writeThroughputBudgetPerCosmosPartition)
       } else {
         logDebug(s"Writing partition with rxjava")
         asyncConnection.importWithRxJava(iter, asyncConnection, writingBatchSize, writingBatchDelayMs, rootPropertyToSave, upsert)
@@ -549,9 +585,10 @@ object CosmosDBSpark extends LoggingTrait {
     def build(): CosmosDBSpark = {
       require(sparkSession.isDefined, "The SparkSession must be set, either explicitly or via the SparkContext")
       val session = sparkSession.get
-      val readConf = config.isDefined match {
-        case true => Config(options, config)
-        case false => Config(session.sparkContext.getConf, options)
+      val readConf = if (config.isDefined) {
+        Config(options, config)
+      } else {
+        Config(session.sparkContext.getConf, options)
       }
 
       logInfo("Read config: " + readConf.toString)
@@ -643,7 +680,7 @@ object CosmosDBSpark extends LoggingTrait {
     * @param jsc the Spark context containing the CosmosDB connection configuration
     * @return a CosmosDBRDD
     */
-  def load(jsc: JavaSparkContext): JavaCosmosDBRDD = builder().javaSparkContext(jsc).build().toJavaRDD()
+  def load(jsc: JavaSparkContext): JavaCosmosDBRDD = builder().javaSparkContext(jsc).build().toJavaRDD
 
   /**
     * Load data from CosmosDB
@@ -652,7 +689,7 @@ object CosmosDBSpark extends LoggingTrait {
     * @return a CosmosDBRDD
     */
   def load(jsc: JavaSparkContext, readConfig: Config): JavaCosmosDBRDD =
-    builder().javaSparkContext(jsc).config(readConfig).build().toJavaRDD()
+    builder().javaSparkContext(jsc).config(readConfig).build().toJavaRDD
 
   /**
     * Save data to CosmosDB
@@ -738,7 +775,7 @@ case class CosmosDBSpark(sparkSession: SparkSession, readConfig: Config) {
     *
     * @return a JavaCosmosDBRDD
     */
-  def toJavaRDD(): JavaCosmosDBRDD = rdd.toJavaRDD()
+  def toJavaRDD: JavaCosmosDBRDD = rdd.toJavaRDD
 
   /**
     * Creates a `DataFrame` based on the schema derived from the optional type.
@@ -776,7 +813,7 @@ case class CosmosDBSpark(sparkSession: SparkSession, readConfig: Config) {
     * @return a DataFrame.
     */
   def toDF(schema: StructType): DataFrame = {
-    val rowRDD = CosmosDBRowConverter.asRow(schema, rdd)
+    val rowRDD = new CosmosDBRowConverter().asRow(schema, rdd)
     sparkSession.createDataFrame(rowRDD, schema)
   }
 

@@ -20,9 +20,34 @@
   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   * SOFTWARE.
   */
-package com.microsoft.azure.cosmosdb.spark
+package com.microsoft.azure.cosmosdb.spark.streaming
 
-import org.apache.spark.Partition
+import java.io.{FileNotFoundException, PrintWriter, StringWriter}
 
-case class ADLFilePartition(index: Int,
-                            adlFilePath: String) extends Partition
+import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
+import com.microsoft.azure.cosmosdb.spark.config.{Config, CosmosDBConfig}
+
+class NoRetriesCosmosDBWriteStreamRetryPolicyConfig
+ extends CosmosDBWriteStreamRetryPolicyConfig
+ with CosmosDBLoggingTrait
+ with Serializable
+{
+    def isTransient(t: Throwable) : Boolean = {
+        val sw = new StringWriter
+        t.printStackTrace(new PrintWriter(sw))
+        logError(s"NON-TRANSIENT error: ${t.getMessage}, CallStack: ${sw.toString}")
+        false
+    }
+
+    def getMaxTransientRetryCount() : Int = {
+        0
+    }
+
+    def getMaxTransientRetryDurationInMs() : Int = {
+        0
+    }
+
+    def getMaxTransientRetryDelayInMs() : Int = {
+        1
+    }
+}

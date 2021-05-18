@@ -22,21 +22,13 @@
   */
 package com.microsoft.azure.cosmosdb.spark.streaming
 
-import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
-import org.apache.spark.sql.SQLContext
-import org.apache.spark.sql.execution.streaming.Sink
-import org.apache.spark.sql.sources.{DataSourceRegister, StreamSinkProvider}
-import org.apache.spark.sql.streaming.OutputMode
+trait CosmosDBWriteStreamRetryPolicyConfig 
+{
+  def isTransient(t: Throwable) : Boolean
 
-class CosmosDBSinkProvider extends DataSourceRegister
-  with StreamSinkProvider with CosmosDBLoggingTrait {
+  def getMaxTransientRetryCount() : Int
 
-  override def shortName(): String = "CosmosDBSinkProvider"
+  def getMaxTransientRetryDurationInMs() : Int
 
-  override def createSink(sqlContext: SQLContext,
-                          parameters: Map[String, String],
-                          partitionColumns: Seq[String],
-                          outputMode: OutputMode): Sink = {
-    new CosmosDBSink(sqlContext, parameters)
-  }
+  def getMaxTransientRetryDelayInMs() : Int
 }

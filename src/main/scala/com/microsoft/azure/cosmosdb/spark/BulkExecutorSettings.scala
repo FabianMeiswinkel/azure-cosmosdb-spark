@@ -1,6 +1,6 @@
 /**
   * The MIT License (MIT)
-  * Copyright (c) 2016 Microsoft Corporation
+  * Copyright (c) 2020 Microsoft Corporation
   *
   * Permission is hereby granted, free of charge, to any person obtaining a copy
   * of this software and associated documentation files (the "Software"), to deal
@@ -20,23 +20,16 @@
   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   * SOFTWARE.
   */
-package com.microsoft.azure.cosmosdb.spark.streaming
+package com.microsoft.azure.cosmosdb.spark
 
-import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
-import org.apache.spark.sql.SQLContext
-import org.apache.spark.sql.execution.streaming.Sink
-import org.apache.spark.sql.sources.{DataSourceRegister, StreamSinkProvider}
-import org.apache.spark.sql.streaming.OutputMode
-
-class CosmosDBSinkProvider extends DataSourceRegister
-  with StreamSinkProvider with CosmosDBLoggingTrait {
-
-  override def shortName(): String = "CosmosDBSinkProvider"
-
-  override def createSink(sqlContext: SQLContext,
-                          parameters: Map[String, String],
-                          partitionColumns: Seq[String],
-                          outputMode: OutputMode): Sink = {
-    new CosmosDBSink(sqlContext, parameters)
-  }
-}
+/**
+  * Case class for the configuration settings used to initiate bulk executors
+  *
+  * @param maxMiniBatchUpdateCount         specifies the maximum count of update items in a mini-batch
+  *                                        used in bulk import API. Default value is 500
+  * @param partitionKeyOption              Can be used to specify the partition key (optional). If not specified the
+  *                                        partition key definition is retrieved at runtime for the target container
+  */
+private[spark] case class BulkExecutorSettings(
+                                 maxMiniBatchUpdateCount: Int,
+                                 partitionKeyOption: Option[String])

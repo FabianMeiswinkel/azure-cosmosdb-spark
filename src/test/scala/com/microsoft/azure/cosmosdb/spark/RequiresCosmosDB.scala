@@ -29,7 +29,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.{SparkConf, SparkContext}
 import org.scalatest._
 
-trait RequiresCosmosDB extends FlatSpecLike with Matchers with BeforeAndAfterAll with BeforeAndAfterEach with LoggingTrait {
+trait RequiresCosmosDB extends FlatSpecLike with Matchers with BeforeAndAfterAll with BeforeAndAfterEach with CosmosDBLoggingTrait {
 
   val cosmosDBDefaults: CosmosDBDefaults = CosmosDBDefaults()
 
@@ -86,7 +86,7 @@ trait RequiresCosmosDB extends FlatSpecLike with Matchers with BeforeAndAfterAll
   }
 
   def createOrGetDefaultSparkSession(sc: SparkContext): SparkSession = {
-    var builder = SparkSession.builder().config(sc.getConf)
+    val builder = SparkSession.builder().config(sc.getConf)
     val osName = System.getProperty("os.name")
     if (!StringUtils.isEmpty(osName) && osName.toLowerCase().contains("win")) {
       // The spark.sql.warehouse.dir parameter is to workaround an path issue with Spark on Windows

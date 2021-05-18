@@ -1,6 +1,6 @@
 /**
   * The MIT License (MIT)
-  * Copyright (c) 2016 Microsoft Corporation
+  * Copyright (c) 2020 Microsoft Corporation
   *
   * Permission is hereby granted, free of charge, to any person obtaining a copy
   * of this software and associated documentation files (the "Software"), to deal
@@ -20,23 +20,13 @@
   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   * SOFTWARE.
   */
-package com.microsoft.azure.cosmosdb.spark.streaming
+package com.microsoft.azure.cosmosdb.spark
 
-import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
-import org.apache.spark.sql.SQLContext
-import org.apache.spark.sql.execution.streaming.Sink
-import org.apache.spark.sql.sources.{DataSourceRegister, StreamSinkProvider}
-import org.apache.spark.sql.streaming.OutputMode
-
-class CosmosDBSinkProvider extends DataSourceRegister
-  with StreamSinkProvider with CosmosDBLoggingTrait {
-
-  override def shortName(): String = "CosmosDBSinkProvider"
-
-  override def createSink(sqlContext: SQLContext,
-                          parameters: Map[String, String],
-                          partitionColumns: Seq[String],
-                          outputMode: OutputMode): Sink = {
-    new CosmosDBSink(sqlContext, parameters)
-  }
-}
+/**
+  * Case class for immutable database metadata
+  * @param id                       The name of the database
+  * @param resourceId               The unique resource-id of the database
+  */
+private[spark] case class DatabaseMetadata(
+                             id: String,
+                             resourceId: String)

@@ -22,7 +22,7 @@
   */
 package com.microsoft.azure.cosmosdb.spark.streaming
 
-import com.microsoft.azure.cosmosdb.spark.LoggingTrait
+import com.microsoft.azure.cosmosdb.spark.CosmosDBLoggingTrait
 import org.apache.spark.sql.cosmosdb.util.StreamingWriteTask
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.execution.streaming.Sink
@@ -31,22 +31,28 @@ import com.microsoft.azure.cosmosdb.spark.config.Config
 
 private[spark] class CosmosDBSink(sqlContext: SQLContext,
                                     configMap: Map[String, String])
-  extends Sink with LoggingTrait with Serializable {
+  extends Sink with CosmosDBLoggingTrait with Serializable {
 
   private var lastBatchId: Long = -1L
+  private val retryPolicy: CosmosDBWriteStreamRetryPolicy = new CosmosDBWriteStreamRetryPolicy(configMap)
   
   override def addBatch(batchId: Long, data: DataFrame): Unit = {
     if (batchId <= lastBatchId) {
       logDebug(s"Rerun batchId $batchId")
     } else {
+      logDebug(s"Run batchId $batchId")
       lastBatchId = batchId
     }
 
     val queryExecution: QueryExecution = data.queryExecution
     val schemaOutput = queryExecution.analyzed.output
-    queryExecution.toRdd.foreachPartition( iter => {
+    val config = Config(configMap)
+    val rdd = queryExecution.toRdd
+    logTrace(s"Partition Count:" + rdd.partitions.length)
+
+    rdd.foreachPartition( iter => {
       val writeTask = new StreamingWriteTask()
-      writeTask.importStreamingData(iter, schemaOutput, Config(configMap))
+      writeTask.importStreamingData(iter, schemaOutput, config, retryPolicy)
     })
   }
 }

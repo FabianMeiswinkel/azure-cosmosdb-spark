@@ -3,6 +3,10 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
+# Java
+*.iml
+target/
+
 # User-specific files
 *.rsuser
 *.suo
@@ -336,3 +340,13 @@ ASALocalRun/
 
 # Local History for Visual Studio
 .localhistory/
+.metals/
+.bloop/
+.settings/
+
+.project
+
+.classpath
+.vscode/settings.json
+scalastyle-output.xml
+

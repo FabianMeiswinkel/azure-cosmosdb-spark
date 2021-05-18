@@ -22,7 +22,7 @@
   */
 package com.microsoft.azure.cosmosdb.spark.schema
 
-import com.microsoft.azure.cosmosdb.spark.{DefaultSource, LoggingTrait}
+import com.microsoft.azure.cosmosdb.spark.{DefaultSource, CosmosDBLoggingTrait}
 import com.microsoft.azure.cosmosdb.spark.config._
 import com.microsoft.azure.cosmosdb.spark.rdd.CosmosDBRDD
 import org.apache.spark.rdd.RDD
@@ -36,9 +36,11 @@ class CosmosDBRelation(private val config: Config,
   extends BaseRelation
     with PrunedFilteredScan
     with InsertableRelation
-    with LoggingTrait {
+    with CosmosDBLoggingTrait {
 
   implicit val _: Config = config
+
+  @transient private val cosmosDBRowConverter = new CosmosDBRowConverter(SerializationConfig.fromConfig(config))
 
   // Take sample documents to infer the schema
   private lazy val lazySchema = {
@@ -75,7 +77,7 @@ class CosmosDBRelation(private val config: Config,
       requiredColumns = requiredColumns,
       filters = filters)
 
-    CosmosDBRowConverter.asRow(CosmosDBRelation.pruneSchema(schema, requiredColumns), rdd)
+    cosmosDBRowConverter.asRow(CosmosDBRelation.pruneSchema(schema, requiredColumns), rdd)
   }
 
   override def equals(other: Any): Boolean = other match {
@@ -91,9 +93,10 @@ class CosmosDBRelation(private val config: Config,
 
   def insert(data: DataFrame, overwrite: Boolean): Unit = {
     val dfw = data.write.format(classOf[DefaultSource].toString)
-    overwrite match {
-      case true  => dfw.mode(SaveMode.Overwrite).save()
-      case false => dfw.mode(SaveMode.ErrorIfExists).save()
+    if (overwrite) {
+      dfw.mode(SaveMode.Overwrite).save()
+    } else {
+      dfw.mode(SaveMode.ErrorIfExists).save()
     }
   }
 }
@@ -143,7 +146,7 @@ object CosmosDBRelation {
             mdataBuilder.putLong("idx", idx.toLong)
             mdataBuilder.putString("colname", name)
             //End of non-functional area
-            StructField(s"$name[$idx]", et, true, mdataBuilder.build())
+            StructField(s"$name[$idx]", et, nullable = true, mdataBuilder.build())
         }
       }
     )

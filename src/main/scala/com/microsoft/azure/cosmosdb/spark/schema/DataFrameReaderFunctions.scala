@@ -26,7 +26,7 @@ import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
 
 import com.microsoft.azure.cosmosdb.spark.config.CachingMode.CachingMode
 import com.microsoft.azure.cosmosdb.spark.config._
-import com.microsoft.azure.cosmosdb.spark.{DefaultSource, LoggingTrait}
+import com.microsoft.azure.cosmosdb.spark.{DefaultSource, CosmosDBLoggingTrait, ClientConfiguration}
 import org.apache.commons.lang3.StringUtils
 import org.apache.spark.sql.cosmosdb.util.StreamingUtils
 import org.apache.spark.sql.types.StructType
@@ -40,11 +40,11 @@ object DataFrameReaderFunctions {
   def getCacheKey(configMap: collection.Map[String, String]) : String = {
     val database = configMap.get(CosmosDBConfig.Database)
     val collection = configMap.get(CosmosDBConfig.Collection)
-    s"dbs/$database/colls/$collection"
+    ClientConfiguration.getCollectionLink(database.get, collection.get)
   }
 }
 
-private[spark] case class DataFrameReaderFunctions(@transient dfr: DataFrameReader) extends LoggingTrait {
+private[spark] case class DataFrameReaderFunctions(@transient dfr: DataFrameReader) extends CosmosDBLoggingTrait {
 
   /**
     * Creates a [[DataFrame]] through schema inference via the `T` type, otherwise will sample the collection to
@@ -86,7 +86,7 @@ private[spark] case class DataFrameReaderFunctions(@transient dfr: DataFrameRead
   private def createDataFrame(schema: Option[StructType], readConfig: Option[Config], sqlContext: Option[SQLContext]): DataFrame = {
     var cachingMode: CachingMode = CachingMode.NONE
     var database: String = StringUtils.EMPTY
-    var collection: String = StringUtils.EMPTY
+    val collection: String = StringUtils.EMPTY
     var collectionCacheKey: String = StringUtils.EMPTY
 
     if (readConfig.isDefined) {
